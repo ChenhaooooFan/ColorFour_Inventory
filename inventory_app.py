@@ -9,7 +9,7 @@ from datetime import datetime
 import os
 
 st.set_page_config(page_title="ColorFour 库存系统", layout="centered")
-st.title("📦 ColorFour Inventory 系统")
+st.title("📦 Nailvesta Inventory 系统")
 
 # 上传文件
 pdf_file = st.file_uploader("📤 上传 Picking List PDF", type=["pdf"])
