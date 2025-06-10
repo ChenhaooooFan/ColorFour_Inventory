@@ -152,4 +152,4 @@ if pdf_file and csv_file:
     st.dataframe(history_df, use_container_width=True)
 
 else:
-    st.info("请上传 Picking List PDF 和库存 CSV 以开始处理。")这是我库存系统的代码
+    st.info("请上传 Picking List PDF 和库存 CSV 以开始处理。")
