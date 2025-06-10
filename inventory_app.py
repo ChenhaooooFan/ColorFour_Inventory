@@ -14,6 +14,46 @@ st.title("📦 ColorFour Inventory 系统")
 pdf_file = st.file_uploader("📤 上传 Picking List PDF", type=["pdf"])
 csv_file = st.file_uploader("📥 上传库存表 CSV", type=["csv"])
 
+# ========= 👇 整合 Pick List 功能 👇 =========
+st.subheader("🧾 整合 Pick List（减少重复拣货）")
+
+# 从库存表中提取 SKU → 产品名 / 尺码 映射
+sku_info = {}
+if "SKU编码" in stock_df.columns and "产品名称" in stock_df.columns and "尺码" in stock_df.columns:
+    for _, row in stock_df.iterrows():
+        sku = str(row["SKU编码"]).strip()
+        sku_info[sku] = {
+            "产品名称": str(row["产品名称"]).strip(),
+            "尺码": str(row["尺码"]).strip()
+        }
+
+# 构建 Pick List 表格
+pick_list_data = []
+for sku, qty in sku_counts.items():
+    info = sku_info.get(sku, {})
+    pick_list_data.append({
+        "产品名称": info.get("产品名称", ""),
+        "SKU编码": sku,
+        "尺码": info.get("尺码", ""),
+        "数量": qty
+    })
+pick_list_df = pd.DataFrame(pick_list_data)
+
+# 显示 Pick List 表格
+st.dataframe(pick_list_df, use_container_width=True)
+
+# Pick List 下载
+pick_output = BytesIO()
+with pd.ExcelWriter(pick_output, engine='openpyxl') as writer:
+    pick_list_df.to_excel(writer, index=False)
+st.download_button(
+    label="📦 下载拣货单 Excel（Pick List）",
+    data=pick_output.getvalue(),
+    file_name="Pick_List_整合拣货单.xlsx"
+)
+# ========= 👆 整合 Pick List 功能 👆 =========
+
+
 # 新增换货表上传功能
 exchange_mode = st.radio("今天是否有达人换货？", ["否", "是"])
 exchange_df = None
