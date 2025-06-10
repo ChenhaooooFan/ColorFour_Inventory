@@ -6,7 +6,6 @@ from collections import defaultdict
 from io import BytesIO
 from datetime import datetime
 import os
-from fpdf import FPDF
 
 st.set_page_config(page_title="NailVesta 库存系统", layout="centered")
 st.title("📦 ColorFour Inventory 系统")
@@ -14,6 +13,7 @@ st.title("📦 ColorFour Inventory 系统")
 # 上传文件
 pdf_file = st.file_uploader("📤 上传 Picking List PDF", type=["pdf"])
 csv_file = st.file_uploader("📥 上传库存表 CSV", type=["csv"])
+
 
 # 新增换货表上传功能
 exchange_mode = st.radio("今天是否有达人换货？", ["否", "是"])
@@ -39,13 +39,13 @@ if pdf_file and csv_file:
         st.stop()
     stock_date_col = stock_col[0]
 
-    # 提取 PDF 中 Item quantity
+    # 识别 PDF 中 Item quantity
     with pdfplumber.open(pdf_file) as pdf:
         first_page_text = pdf.pages[0].extract_text()
         item_match = re.search(r'Item quantity[:：]?\s*(\d+)', first_page_text)
         expected_total = int(item_match.group(1)) if item_match else None
 
-    # 提取 SKU 和数量
+    # 提取 SKU + 数量 & 未识别行
     sku_counts = defaultdict(int)
     missing_lines = []
     raw_missing = []
@@ -65,7 +65,7 @@ if pdf_file and csv_file:
                         missing_lines.append(qty)
                         raw_missing.append(line.strip())
 
-    # 补录缺失 SKU
+    # 缺 SKU 补录
     if missing_lines:
         st.warning("⚠️ 以下出货记录缺 SKU，请补录：")
         manual_entries = {}
@@ -78,7 +78,7 @@ if pdf_file and csv_file:
                     sku_counts[sku.strip()] += missing_lines[i]
             st.success("✅ 已将补录 SKU 添加进库存统计")
 
-    # 处理换货
+    # 处理换货：替换 SKU
     if exchange_df is not None:
         if "原款式" in exchange_df.columns and "换货款式" in exchange_df.columns:
             for _, row in exchange_df.iterrows():
@@ -151,50 +151,5 @@ if pdf_file and csv_file:
     st.subheader("📝 上传历史记录")
     st.dataframe(history_df, use_container_width=True)
 
-    # 📄 下载 SKU 汇总版 Picking List（分组）
-    def generate_grouped_sku_pdf(sku_counts_dict, stock_df) -> BytesIO:
-        sku_name_map = dict(zip(stock_df["SKU编码"], stock_df["款式名"]))
-        grouped = defaultdict(lambda: defaultdict(int))
-
-        for seller_sku, qty in sku_counts_dict.items():
-            full_name = sku_name_map.get(seller_sku, f"(未识别) {seller_sku}")
-            if ',' in full_name:
-                main_name, size = map(str.strip, full_name.rsplit(',', 1))
-            else:
-                main_name, size = full_name.strip(), ''
-            grouped[main_name][size] += qty
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        pdf.cell(0, 10, "SKU 汇总版 Picking List（分组显示）", ln=True, align='C')
-        pdf.ln(8)
-
-        pdf.set_font("Arial", size=11)
-        for main_name in sorted(grouped.keys()):
-            pdf.set_font("Arial", style="B", size=11)
-            pdf.cell(0, 10, main_name, ln=True)
-            pdf.set_font("Arial", size=11)
-
-            for size in sorted(grouped[main_name].keys(), key=lambda x: ["XS", "S", "M", "L", "XL", "F", ""].index(x) if x in ["XS", "S", "M", "L", "XL", "F", ""] else 999):
-                qty = grouped[main_name][size]
-                label = f"  - {size}" if size else "  - 无尺码"
-                pdf.cell(0, 8, f"{label}: {qty}", ln=True)
-            pdf.ln(4)
-
-        output_pdf = BytesIO()
-        pdf.output(output_pdf)
-        output_pdf.seek(0)
-        return output_pdf
-
-    st.subheader("📄 下载 SKU 汇总版 Picking List（分组显示）")
-    grouped_pdf = generate_grouped_sku_pdf(sku_counts, stock_df)
-    st.download_button(
-        label="📥 下载分组展示 PDF",
-        data=grouped_pdf,
-        file_name="分组SKU_汇总PickingList.pdf",
-        mime="application/pdf"
-    )
-
 else:
-    st.info("请上传 Picking List PDF 和库存 CSV 以开始处理。")
+    st.info("请上传 Picking List PDF 和库存 CSV 以开始处理。")这是我库存系统的代码
