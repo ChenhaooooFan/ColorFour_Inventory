@@ -50,6 +50,7 @@ if selected_pdfs and csv_file:
     stock_date_col = stock_col[0]
 
     # 识别 PDF 中 Item quantity（改：逐个 PDF 识别并汇总）
+    pdf_item_list = []
     expected_total = None
     total_expected_sum = 0
     found_any_expected = False
@@ -57,11 +58,17 @@ if selected_pdfs and csv_file:
         with pdfplumber.open(pf) as pdf:
             first_page_text = pdf.pages[0].extract_text()
             item_match = re.search(r'Item quantity[:：]?\s*(\d+)', first_page_text or "")
+            qty_val = int(item_match.group(1)) if item_match else ""
+            pdf_item_list.append({"PDF文件": pf.name, "Item quantity": qty_val})
             if item_match:
                 total_expected_sum += int(item_match.group(1))
                 found_any_expected = True
     if found_any_expected:
         expected_total = total_expected_sum  # 汇总后的期望数量
+
+    # 新增：显示每个 PDF 的单独 Item quantity 小表
+    st.subheader("📄 各 PDF 的 Item quantity")
+    st.dataframe(pd.DataFrame(pdf_item_list), use_container_width=True)
 
     # 提取 SKU + 数量 & 未识别行（改：遍历多个 PDF，累加结果；提取规则不变）
     sku_counts = defaultdict(int)
@@ -82,7 +89,6 @@ if selected_pdfs and csv_file:
                         if match_loose:
                             qty = int(match_loose.group(1))
                             missing_lines.append(qty)
-                            # 为了不改变原有展示方式，这里仍只记录原始行文本（不附加文件名）
                             raw_missing.append(line.strip())
 
     # 缺 SKU 补录（保持原逻辑）
