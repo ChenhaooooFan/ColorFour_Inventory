@@ -24,7 +24,7 @@ if pdf_files:
     )
     selected_pdfs = [f for f in pdf_files if f.name in selected_names]
 
-# 新增换货表上传功能
+# 换货表上传
 exchange_mode = st.radio("今天是否有达人换货？", ["否", "是"])
 exchange_df = None
 if exchange_mode == "是":
@@ -47,10 +47,11 @@ if selected_pdfs and csv_file:
         st.error("❌ 未找到库存日期列（如 '06/03'）")
         st.stop()
     stock_date_col = stock_col[0]
+    stock_skus = set(stock_df["SKU编码"].astype(str).str.strip())
 
     # 存放每个 PDF 的标注数量 & 实际提取数量
     pdf_item_list = []
-    pdf_sku_counts = {}  # {pdf文件名: {sku: qty}}
+    pdf_sku_counts = {}
 
     for pf in selected_pdfs:
         # 1. 获取 PDF 标注数量
@@ -72,17 +73,27 @@ if selected_pdfs and csv_file:
                     else:
                         match_loose = re.search(r'^(\d{1,3})\s+\d{9,}', line.strip())
                         if match_loose:
-                            # 缺SKU的数量，这里先加到一个临时SKU里
                             sku_counts_single[f"MISSING_{len(pdf_item_list)}"] += int(match_loose.group(1))
 
         pdf_sku_counts[pf.name] = sku_counts_single
 
-        # 3. 对账状态
-        actual_total = sum(qty for sku, qty in sku_counts_single.items() if not sku.startswith("MISSING_"))
+        # 3. 计算提取数量（剔除 NM001 如果库存无此 SKU）
+        actual_total = 0
+        nm001_qty = 0
+        for sku, qty in sku_counts_single.items():
+            if sku == "NM001" and sku not in stock_skus:
+                nm001_qty += qty
+                continue
+            if not sku.startswith("MISSING_"):
+                actual_total += qty
+
+        # 4. 状态判定
         if qty_val == "":
             status = "⚠️ 无标注"
         elif actual_total == qty_val:
             status = "✅ 一致"
+        elif actual_total + nm001_qty == qty_val:
+            status = f"✅ 一致（差 {nm001_qty} 件，均为 NM001，库存无此 SKU）"
         else:
             status = f"❌ 不一致（差 {actual_total - qty_val}）"
 
@@ -93,13 +104,24 @@ if selected_pdfs and csv_file:
             "状态": status
         })
 
-    # 显示小表 + 合计行
+    # 小表 + 合计行
     st.subheader("📄 各 PDF 的 Item quantity 对账表")
     pdf_df = pd.DataFrame(pdf_item_list)
     if not pdf_df.empty:
         total_expected = pdf_df["Item quantity"].replace("", 0).astype(int).sum()
         total_actual = pdf_df["提取出货数量"].sum()
-        total_status = "✅ 一致" if total_expected == total_actual else f"❌ 不一致（差 {total_actual - total_expected}）"
+        # 计算 NM001 总数量（库存无此 SKU 时）
+        nm001_total_qty = 0
+        for counts in pdf_sku_counts.values():
+            for sku, qty in counts.items():
+                if sku == "NM001" and sku not in stock_skus:
+                    nm001_total_qty += qty
+        if total_actual + nm001_total_qty == total_expected:
+            total_status = f"✅ 一致（差 {nm001_total_qty} 件，均为 NM001，库存无此 SKU）"
+        elif total_actual == total_expected:
+            total_status = "✅ 一致"
+        else:
+            total_status = f"❌ 不一致（差 {total_actual - total_expected}）"
         total_row = pd.DataFrame({
             "PDF文件": ["合计"],
             "Item quantity": [total_expected],
@@ -109,7 +131,7 @@ if selected_pdfs and csv_file:
         pdf_df = pd.concat([pdf_df, total_row], ignore_index=True)
     st.dataframe(pdf_df, use_container_width=True)
 
-    # —— 下面合并所有 PDF 的 SKU 数据（保持原逻辑）——
+    # 合并所有 PDF 的 SKU 数据
     sku_counts_all = defaultdict(int)
     missing_lines = []
     raw_missing = []
@@ -121,7 +143,7 @@ if selected_pdfs and csv_file:
             else:
                 sku_counts_all[sku] += qty
 
-    # 缺 SKU 补录（保持原逻辑）
+    # 缺 SKU 补录
     if missing_lines:
         st.warning("⚠️ 以下出货记录缺 SKU，请补录：")
         manual_entries = {}
@@ -133,7 +155,7 @@ if selected_pdfs and csv_file:
                     sku_counts_all[sku.strip()] += missing_lines[i]
             st.success("✅ 已将补录 SKU 添加进库存统计")
 
-    # 处理换货（保持原逻辑）
+    # 换货处理
     if exchange_df is not None:
         if "原款式" in exchange_df.columns and "换货款式" in exchange_df.columns:
             for _, row in exchange_df.iterrows():
@@ -159,15 +181,21 @@ if selected_pdfs and csv_file:
         summary_df["New Stock"].sum()
     ]
 
-    # 展示表格
+    # 库存更新结果
     st.subheader("📊 库存更新结果")
     st.dataframe(summary_df, use_container_width=True)
 
-    # 总对账
+    # 总对账（同样 NM001 例外）
     total_sold = summary_df.loc["合计", "Sold Qty"]
+    nm001_total_qty = 0
+    for sku, qty in sku_counts_all.items():
+        if sku == "NM001" and sku not in stock_skus:
+            nm001_total_qty += qty
     if total_expected and total_expected > 0:
         if total_sold == total_expected:
             st.success(f"✅ 提取成功：共 {total_sold} 件，与 PDF 标注汇总一致")
+        elif total_sold + nm001_total_qty == total_expected:
+            st.success(f"✅ 提取成功：共 {total_sold} 件（差 {nm001_total_qty} 件，均为 NM001，库存无此 SKU），与 PDF 标注汇总一致")
         else:
             st.error(f"❌ 提取数量 {total_sold} 与 PDF 标注汇总 {total_expected} 不一致")
     else:
