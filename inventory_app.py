@@ -7,7 +7,7 @@ from io import BytesIO
 from datetime import datetime
 import os
 
-st.set_page_config(page_title="NailVesta 库存系统", layout="centered")
+st.set_page_config(page_title="NailVesta 库存系统💗", layout="centered")
 st.title("ColorFour Inventory 系统")
 
 # 上传文件（PDF 支持多选）
