@@ -42,6 +42,29 @@ if st.session_state.show_exchange:
             exchange_df = pd.read_excel(exchange_file)
         st.success("换货表已上传")
 
+# ========= 新增：文本清洗 & 断行修复 =========
+def normalize_text(t: str) -> str:
+    t = t.replace("\u00ad", "").replace("\u200b", "").replace("\u00a0", " ")
+    t = t.replace("–", "-").replace("—", "-")
+    return t
+
+def fix_orphan_digit_before_size(txt: str) -> str:
+    """
+    修复形如：
+      NPJ011NPX01\n5-M  → NPJ011NPX015-M
+    的换行折断（最后一位数字被挪到下一行后跟 -SIZE）。
+    """
+    pattern = re.compile(
+        r'(?P<prefix>(?:[A-Z]{3}\d{3}){0,3}[A-Z]{3}\d{2})\s*[\r\n]+\s*(?P<d>\d)\s*-\s*(?P<size>[SML])'
+    )
+    def _join(m):
+        return f"{m.group('prefix')}{m.group('d')}-{m.group('size')}"
+    prev, cur = None, txt
+    while prev != cur:
+        prev = cur
+        cur = pattern.sub(_join, cur)
+    return cur
+
 # —— Bundle 拆分工具函数（升级为通吃 1–4 件）——
 def expand_bundle_or_single(sku_with_size: str, qty: int, counter: dict):
     """
@@ -55,7 +78,7 @@ def expand_bundle_or_single(sku_with_size: str, qty: int, counter: dict):
       - 按每 6 位切片，生成 'XXXXXX-Size' 列表，分别累计相同 qty
     其他不合规字符串保持原样累计（与原逻辑一致，保证宽容性）
     """
-    sku_with_size = sku_with_size.strip()
+    sku_with_size = re.sub(r'\s+', '', sku_with_size.strip())
     if "-" not in sku_with_size:
         counter[sku_with_size] += qty
         return
@@ -65,7 +88,6 @@ def expand_bundle_or_single(sku_with_size: str, qty: int, counter: dict):
     size = size.strip()
 
     if len(code) % 6 == 0 and 6 <= len(code) <= 24:
-        # 校验每段是否都是 3字母+3数字
         segments = [code[i:i+6] for i in range(0, len(code), 6)]
         if all(re.fullmatch(r"[A-Z]{3}\d{3}", seg) for seg in segments):
             for seg in segments:
@@ -89,11 +111,15 @@ if selected_pdfs and csv_file:
     stock_date_col = stock_col[0]
     stock_skus = set(stock_df["SKU编码"].astype(str).str.strip())
 
-    # —— 每个 PDF：读取标注值、按原规则提取、另外专项扫描 NM001 / Holiday Bunny（仅用于对账说明）——
+    # —— 每个 PDF：读取标注值、提取 SKU（新逻辑），另外专项扫描 NM001 / Holiday Bunny（仅对账说明）——
     pdf_item_list = []
     pdf_sku_counts = {}
     pdf_nm001_counts = {}
     pdf_hb_counts = {}
+
+    # 提取 SKU 的核心正则（允许跨行/空格；1–4 段）
+    SKU_BUNDLE = re.compile(r'((?:[A-Z]{3}\d{3}[\s\n]*){1,4}-[SML])', re.DOTALL)
+    QTY_AFTER  = re.compile(r'\b([1-9]\d{0,2})\b')
 
     def _scan_holiday_bunny_qty(line: str) -> int:
         if not re.search(r'holiday\s*bunny', line, flags=re.I):
@@ -112,28 +138,34 @@ if selected_pdfs and csv_file:
         # 1) PDF 标注 Item quantity（保持原识别）
         with pdfplumber.open(pf) as pdf:
             first_page_text = pdf.pages[0].extract_text()
-            item_match = re.search(r'Item quantity[:：]?\s*(\d+)', first_page_text or "")
+            first_page_text = normalize_text(first_page_text or "")
+            item_match = re.search(r'Item\s+quantity[:：]?\s*(\d+)', first_page_text, re.I)
             qty_val = int(item_match.group(1)) if item_match else ""
 
-        # 2) 提取 SKU（仅此处升级：支持 1–4 件 Bundle）
-        # 原来：([A-Z]{2,}\d{3}-[A-Z])\s+(\d+)\s+\d{9,}
-        # 升级：((?:[A-Z]{3}\d{3}){1,4}-[A-Z])\s+(\d+)\s+\d{9,}
-        pattern = r'((?:[A-Z]{3}\d{3}){1,4}-[A-Z])\s+(\d+)\s+\d{9,}'
+        # 2) 提取 SKU（核心升级：跨行拼接 + bundle 拆分 + 数量就近提取）
         sku_counts_single = defaultdict(int)
+
         with pdfplumber.open(pf) as pdf:
             for page in pdf.pages:
-                lines = (page.extract_text() or "").split("\n")
-                for line in lines:
-                    m = re.search(pattern, line)
-                    if m:
-                        raw_sku, qty = m.group(1), int(m.group(2))
-                        # —— 升级拆分：1–4 件通吃 —— #
-                        expand_bundle_or_single(raw_sku, qty, sku_counts_single)
-                    else:
-                        # 无 SKU 的行，先按你原逻辑放到 MISSING_，稍后手动补录
-                        m2 = re.search(r'^(\d{1,3})\s+\d{9,}', line.strip())
-                        if m2:
-                            sku_counts_single[f"MISSING_{len(pdf_item_list)}"] += int(m2.group(1))
+                page_text = normalize_text(page.extract_text() or "")
+                # 先修复类似 NPX01\n5-M → NPX015-M 的断行
+                page_text_fixed = fix_orphan_digit_before_size(page_text)
+
+                # 2.1 跨行抓 SKU
+                for m in SKU_BUNDLE.finditer(page_text_fixed):
+                    raw_sku = re.sub(r'\s+', '', m.group(1))  # 去掉空白
+                    # 2.2 就近查数量（SKU 后 50 个字符内第一个 1–3 位数字；找不到则默认 1）
+                    lookahead = page_text_fixed[m.end(): m.end() + 50]
+                    mq = QTY_AFTER.search(lookahead)
+                    qty = int(mq.group(1)) if mq else 1
+                    # 2.3 拆 bundle 入计数
+                    expand_bundle_or_single(raw_sku, qty, sku_counts_single)
+
+                # 2.4 兼容：旧的“缺 SKU 行”兜底（行内只有数量 + 订单号）
+                for line in (page_text or "").split("\n"):
+                    m2 = re.search(r'^\s*(\d{1,3})\s+\d{9,}\s*$', line.strip())
+                    if m2:
+                        sku_counts_single[f"MISSING_{len(pdf_item_list)}"] += int(m2.group(1))
 
         pdf_sku_counts[pf.name] = sku_counts_single
 
@@ -141,7 +173,6 @@ if selected_pdfs and csv_file:
         nm001_qty_scan = 0
         # 3b) Holiday Bunny 扫描（仅用于对账说明，不参与库存扣减）
         hb_qty_scan = 0
-
         with pdfplumber.open(pf) as pdf:
             for page in pdf.pages:
                 lines = (page.extract_text() or "").split("\n")
