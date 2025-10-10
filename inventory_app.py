@@ -9,7 +9,7 @@ import os
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="NailVesta 库存系统", layout="centered")
-st.title("ColorFour Inventory 系统（fitz 解析 + bundle 修复 + Mystery 说明）")
+st.title("ColorFour Inventory 系统（fitz 解析 + bundle 修复 + Mystery 说明 + NM001 无尺码支持）")
 
 # 上传文件（PDF 支持多选）
 pdf_files = st.file_uploader("上传 Picking List PDF（可多选）", type=["pdf"], accept_multiple_files=True)
@@ -43,10 +43,15 @@ if st.session_state.show_exchange:
         st.success("换货表已上传")
 
 # ---------- 规则与小工具 ----------
-# 允许 1–4 件的组合，单件可为标准 6 位 SKU（如 ABC123）或 Mystery 'NM001'，尾随尺码 -S/M/L
-SKU_BUNDLE = re.compile(r'((?:[A-Z]{3}\d{3}|NM001){1,4}-[SML])', re.DOTALL)
-# SKU 右侧 1–3 位数量
-QTY_AFTER = re.compile(r'\b([1-9]\d{0,2})\b')
+# 1) 含尺码的组合（bundle）：允许 1–4 件；部件可为标准 6 位或 NM001；结尾必须 -S/M/L
+SKU_BUNDLE_WITH_SIZE = re.compile(r'((?:[A-Z]{3}\d{3}|NM001){1,4}-(?:S|M|L))', re.DOTALL)
+
+# 2) 仅允许 NM001 无尺码（你的单独栏场景）
+SKU_SOLO_NM_ONLY = re.compile(r'\bNM001\b')
+
+# 数量：1–3 位整数（避免把后面的长订单号当成数量）
+QTY_AFTER_SHORT = re.compile(r'\b([1-9]\d{0,2})\b')
+
 # “Item quantity”
 ITEM_QTY_RE = re.compile(r"Item\s+quantity[:：]?\s*(\d+)", re.I)
 
@@ -58,16 +63,17 @@ def normalize_text(t: str) -> str:
 def fix_orphan_digit_before_size(txt: str) -> str:
     """
     修复形如：NPJ011NPX01\n5-M → NPJ011NPX015-M 的换行折断
+    同时兼容 NM001 出现在组合中
     """
     pattern = re.compile(
         r'(?P<prefix>(?:[A-Z]{3}\d{3}|NM001){0,3}(?:[A-Z]{3}\d{2}|NM001))\s*[\r\n]+\s*(?P<d>\d)\s*-\s*(?P<size>[SML])'
     )
     def _join(m):
-        # 若前缀最后是 NM001，则不追加 d（NM001 长度为 5）；否则拼接成 6 位
         prefix = m.group('prefix')
         d = m.group('d')
         size = m.group('size')
         if prefix.endswith('NM001'):
+            # NM001 长度固定，不拼接 d
             return f"{prefix}-{size}"
         return f"{prefix}{d}-{size}"
     prev = None
@@ -78,44 +84,26 @@ def fix_orphan_digit_before_size(txt: str) -> str:
     return cur
 
 def parse_code_parts(code: str):
-    """
-    将无连字符的主体按以下顺序切块：
-      - 优先匹配前缀 'NM001'
-      - 否则匹配标准 6 位块 [A-Z]{3}\d{3}
-    允许任意顺序组合，如：
-      NM001NPJ011 / NPX015NM001 / NM001NM001 / NPJ011NPX015 等
-    全部成功返回 part 列表，否则返回 None
-    """
-    parts = []
-    i = 0
-    n = len(code)
+    """将主体按 NM001 或 6位块切分，限制 1–4 件。全部成功返回列表，否则 None。"""
+    parts, i, n = [], 0, len(code)
     while i < n:
         if code.startswith('NM001', i):
-            parts.append('NM001')
-            i += 5
-            continue
+            parts.append('NM001'); i += 5; continue
         seg = code[i:i+6]
         if re.fullmatch(r'[A-Z]{3}\d{3}', seg):
-            parts.append(seg)
-            i += 6
-            continue
-        # 无法继续匹配
+            parts.append(seg); i += 6; continue
         return None
-    # 1–4 件限制
-    if 1 <= len(parts) <= 4:
-        return parts
-    return None
+    return parts if 1 <= len(parts) <= 4 else None
 
 def expand_bundle(counter: dict, sku_with_size: str, qty: int):
     """
-    将 1–4 件组合拆成独立 SKU 计数；返回：
-      extra_units: 因组合导致的“额外件数”（(件数-1)*qty）
-      mystery_units: 其中属于 NM001 的件数（parts 中出现 NM001 的次数 * qty）
+    拆组合：
+    返回 extra_units=(件数-1)*qty；mystery_units=NM001 次数 * qty
     """
     s = re.sub(r'\s+', '', sku_with_size)
     if '-' not in s:
         counter[s] += qty
-        return 0, 0
+        return 0, qty if s == 'NM001' else 0
     code, size = s.split('-', 1)
     parts = parse_code_parts(code)
     if parts:
@@ -127,24 +115,19 @@ def expand_bundle(counter: dict, sku_with_size: str, qty: int):
                 mystery_units += qty
         extra = (len(parts) - 1) * qty
         return extra, mystery_units
-    # 回退：非标准就按原样记
     counter[s] += qty
-    # 若恰是 NM001-Size，也记录为 Mystery
-    mystery_units = qty if code == 'NM001' else 0
-    return 0, mystery_units
+    return 0, qty if code == 'NM001' else 0
 
 def parse_pdf_with_fitz(file_bytes: bytes):
     """
     返回：
       expected_total_raw: PDF 里 “Item quantity”
-      sku_counts_single: dict，键为 Seller SKU（含尺码），值为累计数量
-      bundle_extra_units: 因 bundle（多件被 PDF 记为 1 件）产生的“额外件数”
-      mystery_units: 解析中识别到的 NM001 件数（计数含数量）
+      sku_counts_single: dict（含尺码/无尺码）
+      bundle_extra_units: 因 bundle 产生的额外件数
+      mystery_units: 识别到的 NM001 件数（按数量）
     """
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages_text = []
-    for p in doc:
-        pages_text.append(p.get_text("text"))
+    pages_text = [p.get_text("text") for p in doc]
     text_raw = "\n".join(pages_text)
     text = normalize_text(text_raw)
 
@@ -155,19 +138,33 @@ def parse_pdf_with_fitz(file_bytes: bytes):
     # 修复换行
     text_fixed = fix_orphan_digit_before_size(text)
 
-    # 匹配所有 SKU（允许跨行）
     sku_counts = defaultdict(int)
     bundle_extra_units = 0
     mystery_units = 0
-    for m in SKU_BUNDLE.finditer(text_fixed):
-        sku_raw = re.sub(r'\s+', '', m.group(1))
-        # 在 token 之后的一小段里找 Qty
-        after = text_fixed[m.end(): m.end()+50]
-        mq = QTY_AFTER.search(after)
+
+    # —— 第一轮：带尺码的组合（含单件 -S/M/L）——
+    for m in SKU_BUNDLE_WITH_SIZE.finditer(text_fixed):
+        token = re.sub(r'\s+', '', m.group(1))
+        after = text_fixed[m.end(): m.end()+60]
+        mq = QTY_AFTER_SHORT.search(after)
         qty = int(mq.group(1)) if mq else 1
-        extra, myst = expand_bundle(sku_counts, sku_raw, qty)
+        extra, myst = expand_bundle(sku_counts, token, qty)
         bundle_extra_units += extra
         mystery_units += myst
+
+    # —— 第二轮：仅针对“无尺码 NM001”——
+    for m in SKU_SOLO_NM_ONLY.finditer(text_fixed):
+        # 若后面紧跟 '-S/M/L'，说明是 NM001-M 等，已在第一轮计入 → 跳过
+        next_chunk = text_fixed[m.end(): m.end()+3]
+        if '-' in next_chunk:  # 例如 '-M'、'-S'、'-L'
+            continue
+        # 在其后更宽的窗口里抓数量（表格布局留足距离）
+        after = text_fixed[m.end(): m.end()+80]
+        mq = QTY_AFTER_SHORT.search(after)
+        qty = int(mq.group(1)) if mq else 1
+        # 无尺码 NM001 直接以 'NM001' 计数，并计入 Mystery 件数
+        sku_counts['NM001'] += qty
+        mystery_units += qty
 
     return expected_total_raw, sku_counts, bundle_extra_units, mystery_units
 
