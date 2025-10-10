@@ -9,7 +9,7 @@ import os
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="NailVesta 库存系统", layout="centered")
-st.title("ColorFour Inventory 系统（fitz 解析 + bundle 修复）")
+st.title("ColorFour Inventory 系统（fitz 解析 + bundle 修复 + 对账说明）")
 
 # 上传文件（PDF 支持多选）
 pdf_files = st.file_uploader("上传 Picking List PDF（可多选）", type=["pdf"], accept_multiple_files=True)
@@ -25,10 +25,9 @@ if pdf_files:
     )
     selected_pdfs = [f for f in pdf_files if f.name in selected_names]
 
-# —— 按钮触发：是否有达人换货 —— #
+# —— 按钮触发：是否有达人换货 ——
 if "show_exchange" not in st.session_state:
     st.session_state.show_exchange = False
-
 if st.button("有达人换货吗？"):
     st.session_state.show_exchange = True
 
@@ -46,8 +45,8 @@ if st.session_state.show_exchange:
 # ---------- 规则与小工具 ----------
 # 1–4 件 bundle（允许跨行/空格）
 SKU_BUNDLE = re.compile(r'((?:[A-Z]{3}\d{3}){1,4}-[SML])', re.DOTALL)
-# SKU 右侧 1–3 位数量（和你“拣货单汇总工具”的写法保持一致）
-QTY_AFTER  = re.compile(r'\b([1-9]\d{0,2})\b')
+# SKU 右侧 1–3 位数量
+QTY_AFTER = re.compile(r'\b([1-9]\d{0,2})\b')
 # “Item quantity”
 ITEM_QTY_RE = re.compile(r"Item\s+quantity[:：]?\s*(\d+)", re.I)
 
@@ -59,8 +58,7 @@ def normalize_text(t: str) -> str:
 def fix_orphan_digit_before_size(txt: str) -> str:
     """
     修复形如：
-        NPJ011NPX01\n5-M  → NPJ011NPX015-M
-    的换行折断（最后一段“3位数字”被切成“2位在上一行 + 1位在下一行，再接 -SIZE”）。
+    NPJ011NPX01\n5-M → NPJ011NPX015-M 的换行折断
     """
     pattern = re.compile(
         r'(?P<prefix>(?:[A-Z]{3}\d{3}){0,3}[A-Z]{3}\d{2})\s*[\r\n]+\s*(?P<d>\d)\s*-\s*(?P<size>[SML])'
@@ -74,31 +72,42 @@ def fix_orphan_digit_before_size(txt: str) -> str:
         cur = pattern.sub(_join, cur)
     return cur
 
+def split_sku_parts(code: str):
+    """将无连字符的主体部分按 6 位切块（每块形如 ABC123）。"""
+    if len(code) % 6 == 0 and 6 <= len(code) <= 24:
+        parts = [code[i:i+6] for i in range(0, len(code), 6)]
+        if all(re.fullmatch(r'[A-Z]{3}\d{3}', p) for p in parts):
+            return parts
+    return None
+
 def expand_bundle(counter: dict, sku_with_size: str, qty: int):
     """
     将 1–4 件 bundle 拆成独立 SKU 计数。
     例如：NPJ011NPX015-M → NPJ011-M, NPX015-M 各 +qty
+    返回该条目的“额外件数”（用于对账）：(parts-1) * qty
     """
     s = re.sub(r'\s+', '', sku_with_size)
     if '-' not in s:
         counter[s] += qty
-        return
+        return 0
     code, size = s.split('-', 1)
-    if len(code) % 6 == 0 and 6 <= len(code) <= 24:
-        parts = [code[i:i+6] for i in range(0, len(code), 6)]
-        if all(re.fullmatch(r'[A-Z]{3}\d{3}', p) for p in parts):
-            for p in parts:
-                counter[f"{p}-{size}"] += qty
-            return
+    parts = split_sku_parts(code)
+    if parts:
+        for p in parts:
+            counter[f"{p}-{size}"] += qty
+        extra = (len(parts) - 1) * qty
+        return extra
     # 回退：非标准就按原样记
     counter[s] += qty
+    return 0
 
 def parse_pdf_with_fitz(file_bytes: bytes):
     """
-    返回： (expected_total, sku_counts_single)
-    - expected_total: PDF里“Item quantity”
-    - sku_counts_single: dict，键为 Seller SKU（含尺码），值为累计数量
-    解析策略 = 你的“拣货单汇总工具”：整文提取 → 标准化 → 修复换行 → 跨行匹配 SKU → 右侧抓 Qty → expand_bundle
+    返回：
+      expected_total_raw: PDF 里 “Item quantity”
+      sku_counts_single: dict，键为 Seller SKU（含尺码），值为累计数量
+      bundle_extra_units: 因 bundle（多件被 PDF 记为 1 件）产生的“额外件数”
+    解析策略：整文提取 → 标准化 → 修复换行 → 跨行匹配 SKU → 右侧抓 Qty → expand_bundle
     """
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     pages_text = []
@@ -107,24 +116,25 @@ def parse_pdf_with_fitz(file_bytes: bytes):
     text_raw = "\n".join(pages_text)
     text = normalize_text(text_raw)
 
-    # 对账用的 Item quantity（只要第一页也行；整文里搜一遍更稳）
+    # 对账用的 Item quantity
     m_total = ITEM_QTY_RE.search(text)
-    expected_total = int(m_total.group(1)) if m_total else 0
+    expected_total_raw = int(m_total.group(1)) if m_total else 0
 
-    # 关键修复：把“最后一位数字换行到下一行”的 SKU 拼回去
+    # 修复换行
     text_fixed = fix_orphan_digit_before_size(text)
 
     # 匹配所有 SKU（允许跨行）
     sku_counts = defaultdict(int)
+    bundle_extra_units = 0
     for m in SKU_BUNDLE.finditer(text_fixed):
-        sku_raw = re.sub(r'\s+', '', m.group(1))  # 去空白
-        # 在 token 之后的一小段里找 Qty（保持与你可用代码一致，不再强制校验长条码）
+        sku_raw = re.sub(r'\s+', '', m.group(1))
+        # 在 token 之后的一小段里找 Qty
         after = text_fixed[m.end(): m.end()+50]
         mq = QTY_AFTER.search(after)
         qty = int(mq.group(1)) if mq else 1
-        expand_bundle(sku_counts, sku_raw, qty)
+        bundle_extra_units += expand_bundle(sku_counts, sku_raw, qty)
 
-    return expected_total, sku_counts
+    return expected_total_raw, sku_counts, bundle_extra_units
 
 # ---------- 主流程 ----------
 if selected_pdfs and csv_file:
@@ -139,55 +149,84 @@ if selected_pdfs and csv_file:
         st.stop()
     stock_date_col = stock_col[0]
 
-    # —— 每个 PDF：解析 —— #
+    # —— 每个 PDF：解析 ——
     pdf_item_list = []
     pdf_sku_counts = {}
+    per_pdf_expected = []          # 原始 expected
+    per_pdf_extra = []             # bundle 额外件数
+    per_pdf_actual = []            # 实际提取件数
 
     for pf in selected_pdfs:
         file_bytes = pf.read()  # PyMuPDF 需要 bytes
-        expected_total, sku_counts_single = parse_pdf_with_fitz(file_bytes)
+        expected_total_raw, sku_counts_single, bundle_extra_units = parse_pdf_with_fitz(file_bytes)
         pdf_sku_counts[pf.name] = sku_counts_single
+
         actual_total = sum(sku_counts_single.values())
+        expected_adjusted = expected_total_raw + bundle_extra_units
 
         # 对账状态
-        if expected_total == 0:
+        if expected_total_raw == 0:
             status = "未识别到 Item quantity"
-        elif actual_total == expected_total:
+        elif actual_total == expected_total_raw:
             status = "一致"
+        elif actual_total == expected_adjusted:
+            # 关键：即使不一样，但因为 bundle（多件合并计 1）所以是正确的
+            status = f"与PDF标注不一致，但考虑 bundle 后相符（差 {actual_total - expected_total_raw}）"
         else:
-            status = f"不一致（差 {actual_total - expected_total}）"
+            diff = actual_total - expected_total_raw
+            status = f"不一致（差 {diff}；bundle 影响 {bundle_extra_units}）"
 
         pdf_item_list.append({
             "PDF文件": pf.name,
-            "Item quantity": expected_total,
+            "Item quantity（原始）": expected_total_raw,
+            "bundle 调整(+额外件数)": bundle_extra_units,
+            "调整后应为": expected_adjusted,
             "提取出货数量": actual_total,
             "状态": status
         })
 
-    # —— 显示 PDF 对账表 + 合计行 —— 
-    st.subheader("各 PDF 的 Item quantity 对账表")
+        per_pdf_expected.append(expected_total_raw)
+        per_pdf_extra.append(bundle_extra_units)
+        per_pdf_actual.append(actual_total)
+
+    # —— 显示 PDF 对账表 + 合计行 ——
+    st.subheader("各 PDF 的 Item quantity 对账表（含 bundle 调整）")
     pdf_df = pd.DataFrame(pdf_item_list)
-    total_expected = pdf_df["Item quantity"].replace("", 0).astype(int).sum() if not pdf_df.empty else 0
-    total_actual = pdf_df["提取出货数量"].sum() if not pdf_df.empty else 0
-    total_status = "一致" if total_actual == total_expected else f"不一致（差 {total_actual - total_expected}）"
+
+    total_expected_raw = sum(per_pdf_expected) if per_pdf_expected else 0
+    total_bundle_extra = sum(per_pdf_extra) if per_pdf_extra else 0
+    total_expected_adjusted = total_expected_raw + total_bundle_extra
+    total_actual = sum(per_pdf_actual) if per_pdf_actual else 0
 
     if not pdf_df.empty:
-        pdf_df = pd.concat([pdf_df, pd.DataFrame({
-            "PDF文件": ["合计"],
-            "Item quantity": [total_expected],
-            "提取出货数量": [total_actual],
-            "状态": [total_status]
-        })], ignore_index=True)
+        # 合计行
+        if total_actual == total_expected_raw:
+            total_status = "一致"
+        elif total_actual == total_expected_adjusted:
+            total_status = f"与PDF标注不一致，但考虑 bundle 后相符（差 {total_actual - total_expected_raw}）"
+        else:
+            diff = total_actual - total_expected_raw
+            total_status = f"不一致（差 {diff}；bundle 影响 {total_bundle_extra}）"
+
+        total_row = {
+            "PDF文件": "合计",
+            "Item quantity（原始）": total_expected_raw,
+            "bundle 调整(+额外件数)": total_bundle_extra,
+            "调整后应为": total_expected_adjusted,
+            "提取出货数量": total_actual,
+            "状态": total_status
+        }
+        pdf_df = pd.concat([pdf_df, pd.DataFrame([total_row])], ignore_index=True)
 
     st.dataframe(pdf_df, use_container_width=True)
 
-    # —— 汇总所有 PDF 的 SKU —— #
+    # —— 汇总所有 PDF 的 SKU ——
     sku_counts_all = defaultdict(int)
     for counts in pdf_sku_counts.values():
         for sku, qty in counts.items():
             sku_counts_all[sku] += qty
 
-    # —— 换货处理：提取替换 + 库存调整（每行原款 +1、换货 -1） —— 
+    # —— 换货处理：提取替换 + 库存调整（每行原款 +1、换货 -1） ——
     if exchange_df is not None:
         if "原款式" in exchange_df.columns and "换货款式" in exchange_df.columns:
             for _, row in exchange_df.iterrows():
@@ -204,9 +243,10 @@ if selected_pdfs and csv_file:
         else:
             st.warning("换货表中必须包含“原款式”和“换货款式”两列")
 
-    # —— 合并库存数据 —— #
+    # —— 合并库存数据 ——
     stock_df["Sold"] = stock_df["SKU编码"].map(sku_counts_all).fillna(0).astype(int)
     stock_df["New Stock"] = stock_df[stock_date_col] - stock_df["Sold"]
+
     summary_df = stock_df[["SKU编码", stock_date_col, "Sold", "New Stock"]].copy()
     summary_df.columns = ["SKU", "Old Stock", "Sold Qty", "New Stock"]
     summary_df.index += 1
@@ -221,15 +261,20 @@ if selected_pdfs and csv_file:
     st.subheader("库存更新结果")
     st.dataframe(summary_df, use_container_width=True)
 
-    # 总对账
+    # 总对账（优先按“bundle 调整后”核对）
     total_sold = summary_df.loc["合计", "Sold Qty"]
-    if total_expected > 0:
-        if total_sold == total_expected:
+    if total_expected_raw > 0:
+        if total_sold == total_expected_raw:
             st.success(f"提取成功：共 {total_sold} 件，与 PDF 标注汇总一致")
+        elif total_sold == total_expected_adjusted:
+            st.success(f"提取成功：共 {total_sold} 件。与 PDF 原始汇总不一致，但考虑 bundle（多件合并计 1）后相符（差 {total_sold - total_expected_raw}）。")
         else:
-            st.error(f"提取数量 {total_sold} 与 PDF 标注汇总 {total_expected} 不一致")
+            st.error(
+                f"提取数量 {total_sold} 与 PDF 标注汇总不一致；"
+                f"原始: {total_expected_raw}，bundle 调整后: {total_expected_adjusted}。"
+            )
 
-    # 可复制 New Stock
+    # 一键复制 New Stock
     st.subheader("一键复制 New Stock")
     new_stock_text = "\n".join(summary_df.iloc[:-1]["New Stock"].astype(str).tolist())
     st.code(new_stock_text, language="text")
@@ -250,7 +295,9 @@ if selected_pdfs and csv_file:
         "时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "PDF文件": "; ".join([f.name for f in selected_pdfs]),
         "库存文件": csv_file.name,
-        "PDF标注数量": total_expected if total_expected else "",
+        "PDF标注数量（原始）": total_expected_raw if total_expected_raw else "",
+        "bundle 额外件数": total_bundle_extra if total_bundle_extra else "",
+        "PDF标注数量（调整后）": total_expected_adjusted if total_expected_adjusted else "",
         "提取出货数量": total_sold
     }
     if os.path.exists(history_file):
