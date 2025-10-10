@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
 import re
+import fitz  # PyMuPDF
 from collections import defaultdict
 from io import BytesIO
 from datetime import datetime
@@ -44,8 +44,9 @@ if st.session_state.show_exchange:
             exchange_df = pd.read_excel(exchange_file)
         st.success("换货表已上传")
 
+
 # -----------------------
-# 2) 正则与工具（新增：bundle 文本级扫描）
+# 2) 正则与工具（基于 PyMuPDF 的文本）
 # -----------------------
 
 # 允许 1–4 件 bundle（可跨行/空格）
@@ -98,10 +99,7 @@ def scan_bundle_extra_qty_from_text(full_text: str) -> dict:
 
     for m in SKU_BUNDLE.finditer(text_fixed):
         raw = m.group(1)
-        # 去掉空白，仅用于计算段数
-        code = re.sub(r'\s+', '', raw.split('-')[0])
-
-        # 数量：在右侧 50 字符内找第一组 1–3 位数字；找不到按 1 处理
+        code = re.sub(r'\s+', '', raw.split('-')[0])  # 去空白，拿到前缀拼接段
         after = text_fixed[m.end(): m.end()+50]
         mq = QTY_AFTER.search(after)
         qty = int(mq.group(1)) if mq else 1
@@ -113,7 +111,6 @@ def scan_bundle_extra_qty_from_text(full_text: str) -> dict:
 
     return {"extra": extra, "by_parts": by_parts}
 
-# —— Bundle 拆分工具函数（维持原有：用于你手动补录时可拆分入库）——
 def expand_bundle_or_single(sku_with_size: str, qty: int, counter: dict):
     """
     输入形如:
@@ -147,7 +144,7 @@ def expand_bundle_or_single(sku_with_size: str, qty: int, counter: dict):
 
 
 # -----------------------
-# 3) 主流程
+# 3) 主流程（PyMuPDF 抽取）
 # -----------------------
 if selected_pdfs and csv_file:
     st.success("文件上传成功，开始处理...")
@@ -186,43 +183,50 @@ if selected_pdfs and csv_file:
         return 0
 
     for pf in selected_pdfs:
-        # 1) PDF 标注 Item quantity
-        with pdfplumber.open(pf) as pdf:
-            first_page_text = pdf.pages[0].extract_text()
-            item_match = re.search(r'Item quantity[:：]?\s*(\d+)', first_page_text or "")
-            qty_val = int(item_match.group(1)) if item_match else ""
+        # 读取 PDF（PyMuPDF）
+        raw = pf.read()
+        doc = fitz.open(stream=raw, filetype="pdf")
 
-        # 1.5) （新增）拼整份 PDF 文本，做“bundle 文本级扫描”（仅用于对账解释）
+        # —— 整份文本：用于对账的 bundle 解释、Item quantity
         full_text = ""
-        with pdfplumber.open(pf) as pdf:
-            for page in pdf.pages:
-                full_text += (page.extract_text() or "") + "\n"
-        bundle_scan = scan_bundle_extra_qty_from_text(full_text)
-        bundle_extra = bundle_scan["extra"]       # 额外件数
-        bundle_by_parts = bundle_scan["by_parts"] # {2: 套数, 3: 套数, 4: 套数}
+        for page in doc:
+            full_text += page.get_text("text") + "\n"
+        full_text = normalize_text(full_text)
+        full_text = fix_orphan_digit_before_size(full_text)
 
-        # 累加到合计
+        # 1) Item quantity
+        item_match = re.search(r'Item\s+quantity[:：]?\s*(\d+)', full_text, re.I)
+        qty_val = int(item_match.group(1)) if item_match else ""
+
+        # 1.5) （新增）bundle 文本级扫描（仅用于对账解释）
+        bundle_scan = scan_bundle_extra_qty_from_text(full_text)
+        bundle_extra = bundle_scan["extra"]
+        bundle_by_parts = bundle_scan["by_parts"]
         total_bundle_extra += bundle_extra
         for k in (2, 3, 4):
             bundle_sum_by_parts[k] += bundle_by_parts[k]
 
-        # 2) 提取 SKU（保持你的规则）
-        pattern = r'([A-Z]{3}\d{3}(?:[A-Z]{3}\d{3})?-[A-Z])\s+(\d+)\s+\d{9,}'
+        # 2) 提取 SKU（**行级**扫描：PyMuPDF 每页文本 splitlines）
+        pattern = r'([A-Z]{3}\d{3}(?:[A-Z]{3}\d{3})?-[SML])\s+(\d+)\s+\d{9,}'
         sku_counts_single = defaultdict(int)
-        with pdfplumber.open(pf) as pdf:
-            for page in pdf.pages:
-                lines = (page.extract_text() or "").split("\n")
-                for line in lines:
-                    m = re.search(pattern, line)
-                    if m:
-                        raw_sku, qty = m.group(1), int(m.group(2))
-                        # 处理 bundle/单品
-                        expand_bundle_or_single(raw_sku, qty, sku_counts_single)
-                    else:
-                        # 无 SKU 的行，先按原逻辑放到 MISSING_，稍后手动补录
-                        m2 = re.search(r'^(\d{1,3})\s+\d{9,}', line.strip())
-                        if m2:
-                            sku_counts_single[f"MISSING_{len(pdf_item_list)}"] += int(m2.group(1))
+
+        # 再次遍历页，逐行匹配 SKU 与数量
+        doc2 = fitz.open(stream=raw, filetype="pdf")
+        for page in doc2:
+            lines = (page.get_text("text") or "").splitlines()
+            for line in lines:
+                line = normalize_text(line)
+                # 行内可能没有修复的断行场景，但我们主要靠上一轮全文修复做 bundle 解释；
+                # 这里仍按常规一行 "SKU  数量  条码" 匹配
+                m = re.search(pattern, line)
+                if m:
+                    raw_sku, q = m.group(1), int(m.group(2))
+                    expand_bundle_or_single(raw_sku, q, sku_counts_single)
+                else:
+                    # 备用：只有“数量  条码”的行，先记录缺 SKU
+                    m2 = re.search(r'^(\d{1,3})\s+\d{9,}$', line.strip())
+                    if m2:
+                        sku_counts_single[f"MISSING_{len(pdf_item_list)}"] += int(m2.group(1))
 
         pdf_sku_counts[pf.name] = sku_counts_single
 
@@ -231,14 +235,15 @@ if selected_pdfs and csv_file:
         # 3b) Holiday Bunny 扫描（仅用于对账说明，不参与库存扣减）
         hb_qty_scan = 0
 
-        with pdfplumber.open(pf) as pdf:
-            for page in pdf.pages:
-                lines = (page.extract_text() or "").split("\n")
-                for line in lines:
-                    m_nm = re.search(r'\bNM001\b\s+(\d{1,3})\s+\d{9,}', line)
-                    if m_nm:
-                        nm001_qty_scan += int(m_nm.group(1))
-                    hb_qty_scan += _scan_holiday_bunny_qty(line)
+        doc3 = fitz.open(stream=raw, filetype="pdf")
+        for page in doc3:
+            lines = (page.get_text("text") or "").splitlines()
+            for line in lines:
+                line = normalize_text(line)
+                m_nm = re.search(r'\bNM001\b\s+(\d{1,3})\s+\d{9,}', line)
+                if m_nm:
+                    nm001_qty_scan += int(m_nm.group(1))
+                hb_qty_scan += _scan_holiday_bunny_qty(line)
 
         pdf_nm001_counts[pf.name] = nm001_qty_scan
         pdf_hb_counts[pf.name] = hb_qty_scan
@@ -246,14 +251,13 @@ if selected_pdfs and csv_file:
         # 4) 计算该 PDF 的提取出货数量（不含 MISSING_）
         actual_total = sum(q for s, q in sku_counts_single.items() if not s.startswith("MISSING_"))
 
-        # 5) 状态判定（新增：bundle 解释）
+        # 5) 状态判定（含 bundle 解释）
         if qty_val == "":
             status = "无标注"
         else:
             diff = actual_total - qty_val
             if diff == 0:
                 status = "一致"
-            # bundle 解释：提取数量 + 额外件数 == 标注，则一致
             elif actual_total + bundle_extra == qty_val:
                 explain_parts = []
                 if bundle_by_parts[2]:
