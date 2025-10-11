@@ -9,7 +9,7 @@ import os
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="NailVesta 库存系统", layout="centered")
-st.title("ColorFour Inventory 系统（fitz 解析 + bundle 修复 + Mystery 加入期望值）")
+st.title("ColorFour Inventory 系统（fitz 解析 + bundle 修复 + Mystery 抵扣期望）")
 
 # 上传文件（PDF 支持多选）
 pdf_files = st.file_uploader("上传 Picking List PDF（可多选）", type=["pdf"], accept_multiple_files=True)
@@ -49,7 +49,7 @@ SKU_BUNDLE_WITH_SIZE = re.compile(r'((?:[A-Z]{3}\d{3}|NM001){1,4}-(?:S|M|L))', r
 # 2) 仅允许 NM001 无尺码（你的单独栏场景）
 SKU_SOLO_NM_ONLY = re.compile(r'\bNM001\b')
 
-# 数量：1–3 位整数，且**后面不能接字母**（避免把 “3D” 的 3 当数量）
+# 数量：1–3 位整数，且后面不能紧跟字母（避免把 “3D” 的 3 当数量）
 QTY_AFTER_SHORT = re.compile(r'\b([1-9]\d{0,2})(?![A-Za-z])\b')
 
 # “Item quantity”
@@ -73,7 +73,6 @@ def fix_orphan_digit_before_size(txt: str) -> str:
         d = m.group('d')
         size = m.group('size')
         if prefix.endswith('NM001'):
-            # NM001 长度固定，不拼接 d
             return f"{prefix}-{size}"
         return f"{prefix}{d}-{size}"
     prev = None
@@ -103,7 +102,7 @@ def expand_bundle(counter: dict, sku_with_size: str, qty: int):
     s = re.sub(r'\s+', '', sku_with_size)
     if '-' not in s:
         counter[s] += qty
-        return 0, qty if s == 'NM001' else 0
+        return 0, (qty if s == 'NM001' else 0)
     code, size = s.split('-', 1)
     parts = parse_code_parts(code)
     if parts:
@@ -116,7 +115,7 @@ def expand_bundle(counter: dict, sku_with_size: str, qty: int):
         extra = (len(parts) - 1) * qty
         return extra, mystery_units
     counter[s] += qty
-    return 0, qty if code == 'NM001' else 0
+    return 0, (qty if code == 'NM001' else 0)
 
 def parse_pdf_with_fitz(file_bytes: bytes):
     """
@@ -131,11 +130,9 @@ def parse_pdf_with_fitz(file_bytes: bytes):
     text_raw = "\n".join(pages_text)
     text = normalize_text(text_raw)
 
-    # 对账用的 Item quantity
     m_total = ITEM_QTY_RE.search(text)
     expected_total_raw = int(m_total.group(1)) if m_total else 0
 
-    # 修复换行
     text_fixed = fix_orphan_digit_before_size(text)
 
     sku_counts = defaultdict(int)
@@ -156,13 +153,11 @@ def parse_pdf_with_fitz(file_bytes: bytes):
     for m in SKU_SOLO_NM_ONLY.finditer(text_fixed):
         # 若后面紧跟 '-S/M/L'，说明是 NM001-M 等，已在第一轮计入 → 跳过
         next_chunk = text_fixed[m.end(): m.end()+3]
-        if '-' in next_chunk:  # 例如 '-M'、'-S'、'-L'
+        if '-' in next_chunk:
             continue
-        # 在其后更宽的窗口里抓数量（表格布局留足距离）
         after = text_fixed[m.end(): m.end()+80]
         mq = QTY_AFTER_SHORT.search(after)
         qty = int(mq.group(1)) if mq else 1
-        # 无尺码 NM001 直接以 'NM001' 计数，并计入 Mystery 件数
         sku_counts['NM001'] += qty
         mystery_units += qty
 
@@ -187,42 +182,42 @@ if selected_pdfs and csv_file:
     per_pdf_expected = []      # 原始 expected
     per_pdf_extra = []         # bundle 额外件数
     per_pdf_actual = []        # 实际提取（含 Mystery）
-    per_pdf_mystery = []       # Mystery 件数（要加到期望）
+    per_pdf_mystery = []       # Mystery 件数（用于抵扣期望）
 
     for pf in selected_pdfs:
         file_bytes = pf.read()
         expected_total_raw, sku_counts_single, bundle_extra_units, mystery_units = parse_pdf_with_fitz(file_bytes)
         pdf_sku_counts[pf.name] = sku_counts_single
 
-        actual_total = sum(sku_counts_single.values())                    # 含 Mystery
-        expected_bundle = expected_total_raw + bundle_extra_units         # 仅考虑 bundle
-        expected_with_mystery = expected_bundle + mystery_units           # bundle + Mystery（NM001加入期望）
+        actual_total = sum(sku_counts_single.values())            # 含 Mystery
+        expected_bundle = expected_total_raw + bundle_extra_units # 仅考虑 bundle
+        expected_final = expected_bundle - mystery_units          # ⚠️ bundle − Mystery（抵扣）为最终期望
 
-        # 状态判定（优先：原始一致 → bundle 后 → bundle+Mystery 后）
+        # 状态判定：原始 → bundle → bundle−Mystery
         if expected_total_raw == 0:
             status = "未识别到 Item quantity"
         elif actual_total == expected_total_raw:
             status = "一致"
         elif actual_total == expected_bundle:
             status = f"与PDF标注不一致，但考虑 bundle 后相符（差 {actual_total - expected_total_raw}）"
-        elif actual_total == expected_with_mystery:
+        elif actual_total == expected_final:
             status = (
-                f"与PDF标注不一致，但考虑 bundle 与 Mystery（NM001 +{mystery_units}）后相符"
-                f"（差 {actual_total - expected_total_raw}）"
+                f"与PDF标注不一致，但考虑 bundle 与 Mystery 抵扣后相符"
+                f"（bundle +{bundle_extra_units}，Mystery −{mystery_units}，最终期望 {expected_final}）"
             )
         else:
             diff = actual_total - expected_total_raw
             status = (
-                f"不一致（差 {diff}；bundle 影响 {bundle_extra_units}；"
-                f"Mystery（NM001 +{mystery_units} 计入期望））"
+                f"不一致（差 {diff}；bundle 影响 +{bundle_extra_units}；"
+                f"Mystery 抵扣 −{mystery_units}；按理应为 {expected_final}）"
             )
 
         pdf_item_list.append({
             "PDF文件": pf.name,
             "Item quantity（原始）": expected_total_raw,
-            "bundle 调整(+额外件数)": bundle_extra_units,
-            "Mystery(NM001) 件数（加到期望）": mystery_units,
-            "调整后应为（bundle + Mystery）": expected_with_mystery,
+            "bundle 额外件数(+)": bundle_extra_units,
+            "Mystery(NM001) 件数(−)": mystery_units,
+            "调整后应为（bundle − Mystery）": expected_final,
             "提取出货数量": actual_total,
             "状态": status
         })
@@ -233,14 +228,14 @@ if selected_pdfs and csv_file:
         per_pdf_mystery.append(mystery_units)
 
     # —— 显示 PDF 对账表 + 合计行 ——
-    st.subheader("各 PDF 的 Item quantity 对账表（bundle 与 Mystery 均计入期望）")
+    st.subheader("各 PDF 的 Item quantity 对账表（bundle − Mystery 口径）")
     pdf_df = pd.DataFrame(pdf_item_list)
 
     total_expected_raw = sum(per_pdf_expected) if per_pdf_expected else 0
     total_bundle_extra = sum(per_pdf_extra) if per_pdf_extra else 0
     total_mystery = sum(per_pdf_mystery) if per_pdf_mystery else 0
     total_expected_bundle = total_expected_raw + total_bundle_extra
-    total_expected_with_mystery = total_expected_bundle + total_mystery
+    total_expected_final = total_expected_bundle - total_mystery   # ⚠️ 合计最终期望
     total_actual = sum(per_pdf_actual) if per_pdf_actual else 0
 
     if not pdf_df.empty:
@@ -249,24 +244,24 @@ if selected_pdfs and csv_file:
             total_status = "一致"
         elif total_actual == total_expected_bundle:
             total_status = f"与PDF标注不一致，但考虑 bundle 后相符（差 {total_actual - total_expected_raw}）"
-        elif total_actual == total_expected_with_mystery:
+        elif total_actual == total_expected_final:
             total_status = (
-                f"与PDF标注不一致，但考虑 bundle 与 Mystery（NM001 +{total_mystery}）后相符"
-                f"（差 {total_actual - total_expected_raw}）"
+                f"与PDF标注不一致，但考虑 bundle 与 Mystery 抵扣后相符"
+                f"（bundle +{total_bundle_extra}，Mystery −{total_mystery}，最终期望 {total_expected_final}）"
             )
         else:
             diff = total_actual - total_expected_raw
             total_status = (
-                f"不一致（差 {diff}；bundle 影响 {total_bundle_extra}；"
-                f"Mystery（NM001 +{total_mystery} 计入期望））"
+                f"不一致（差 {diff}；bundle 影响 +{total_bundle_extra}；"
+                f"Mystery 抵扣 −{total_mystery}；按理应为 {total_expected_final}）"
             )
 
         total_row = {
             "PDF文件": "合计",
             "Item quantity（原始）": total_expected_raw,
-            "bundle 调整(+额外件数)": total_bundle_extra,
-            "Mystery(NM001) 件数（加到期望）": total_mystery,
-            "调整后应为（bundle + Mystery）": total_expected_with_mystery,
+            "bundle 额外件数(+)": total_bundle_extra,
+            "Mystery(NM001) 件数(−)": total_mystery,
+            "调整后应为（bundle − Mystery）": total_expected_final,
             "提取出货数量": total_actual,
             "状态": total_status
         }
@@ -297,7 +292,7 @@ if selected_pdfs and csv_file:
         else:
             st.warning("换货表中必须包含“原款式”和“换货款式”两列")
 
-    # —— 合并库存数据 ——
+    # —— 合并库存数据（NM001 同样参与扣减） ——
     stock_df["Sold"] = stock_df["SKU编码"].map(sku_counts_all).fillna(0).astype(int)
     stock_df["New Stock"] = stock_df[stock_date_col] - stock_df["Sold"]
 
@@ -315,7 +310,7 @@ if selected_pdfs and csv_file:
     st.subheader("库存更新结果")
     st.dataframe(summary_df, use_container_width=True)
 
-    # 总对账提示（顺序：原始 → bundle → bundle+NM001）
+    # 总对账提示（顺序：原始 → bundle → bundle−NM001）
     total_sold = summary_df.loc["合计", "Sold Qty"]
     if total_expected_raw > 0:
         if total_sold == total_expected_raw:
@@ -324,16 +319,16 @@ if selected_pdfs and csv_file:
             st.success(
                 f"提取成功：共 {total_sold} 件。与 PDF 原始汇总不一致，但考虑 bundle 后相符（差 {total_sold - total_expected_raw}）。"
             )
-        elif total_sold == total_expected_with_mystery:
+        elif total_sold == total_expected_final:
             st.success(
-                f"提取成功：共 {total_sold} 件。与 PDF 原始汇总不一致，但考虑 bundle 与 Mystery（NM001 +{total_mystery}）后相符"
-                f"（差 {total_sold - total_expected_raw}）。"
+                f"提取成功：共 {total_sold} 件。与 PDF 原始汇总不一致，但考虑 bundle 与 Mystery 抵扣后相符"
+                f"（bundle +{total_bundle_extra}，Mystery −{total_mystery}）。"
             )
         else:
             st.error(
                 f"提取数量 {total_sold} 与 PDF 标注汇总不一致；"
                 f"原始: {total_expected_raw}，bundle 调整后: {total_expected_bundle}，"
-                f"bundle+Mystery 调整后: {total_expected_with_mystery}（NM001 +{total_mystery} 计入期望）。"
+                f"bundle−Mystery 调整后: {total_expected_final}（bundle +{total_bundle_extra}，Mystery −{total_mystery}）。"
             )
 
     # 一键复制 New Stock
@@ -358,9 +353,9 @@ if selected_pdfs and csv_file:
         "PDF文件": "; ".join([f.name for f in selected_pdfs]),
         "库存文件": csv_file.name,
         "PDF标注数量（原始）": total_expected_raw if total_expected_raw else "",
-        "bundle 额外件数": total_bundle_extra if total_bundle_extra else "",
-        "Mystery（NM001）件数（加到期望）": total_mystery if total_mystery else "",
-        "PDF标注数量（调整后，bundle+Mystery）": total_expected_with_mystery if total_expected_with_mystery else "",
+        "bundle 额外件数(+)": total_bundle_extra if total_bundle_extra else "",
+        "Mystery（NM001）件数(−)": total_mystery if total_mystery else "",
+        "PDF标注数量（最终，bundle−Mystery）": total_expected_final if total_expected_final else "",
         "提取出货数量": total_sold
     }
     if os.path.exists(history_file):
