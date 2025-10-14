@@ -31,16 +31,28 @@ if "show_exchange" not in st.session_state:
 if st.button("有达人换货吗？"):
     st.session_state.show_exchange = True
 
-exchange_df = None
+exchange_df = None          # 旧：成对原款/换货（按行做“全量替换 + 库存 ±1”）
+creator_swap_df = None      # 新：达人换货统计表（每行代表 1 件的原→发货调整）
+
 if st.session_state.show_exchange:
-    st.info("请上传换货记录文件（CSV / Excel），将执行：原款 +1、换货 -1（每行各一件）")
-    exchange_file = st.file_uploader("上传换货记录", type=["csv", "xlsx"])
+    st.info("可上传两类换货数据：\n1) 换货记录（CSV/XLSX）：原款 +1、换货 -1（每行各一件，且会尝试把该 SKU 的“全部提取量”转移到新款）\n2) 达人换货统计表（CSV/XLSX）：每行代表发货了 1 件，逐行按 1 件进行“原款 -1 → 发货 +1”并同步库存 +1/-1。")
+    # 旧换货表
+    exchange_file = st.file_uploader("上传换货记录（旧格式：包含列“原款式”“换货款式”）", type=["csv", "xlsx"], key="old_exchange")
     if exchange_file:
         if exchange_file.name.endswith(".csv"):
             exchange_df = pd.read_csv(exchange_file)
         else:
             exchange_df = pd.read_excel(exchange_file)
-        st.success("换货表已上传")
+        st.success("换货记录（旧格式）已上传")
+
+    # 新达人换货统计表
+    creator_swap_file = st.file_uploader("上传达人换货统计表（新格式：每行=1件，包含列“原款式 SKU”“发货款式SKU”）", type=["csv", "xlsx"], key="creator_swap")
+    if creator_swap_file:
+        if creator_swap_file.name.endswith(".csv"):
+            creator_swap_df = pd.read_csv(creator_swap_file)
+        else:
+            creator_swap_df = pd.read_excel(creator_swap_file)
+        st.success("达人换货统计表（逐行一件）已上传")
 
 # ---------- 规则与小工具 ----------
 # 1) 含尺码的组合（bundle）：允许 1–4 件；部件可为标准 6 位或 NM001；结尾必须 -S/M/L
@@ -275,22 +287,71 @@ if selected_pdfs and csv_file:
         for sku, qty in counts.items():
             sku_counts_all[sku] += qty
 
-    # —— 换货处理：提取替换 + 库存调整（每行原款 +1、换货 -1） ——
+    # —— 换货处理（旧格式）：提取替换 + 库存调整（每行原款 +1、换货 -1） ——
     if exchange_df is not None:
         if "原款式" in exchange_df.columns and "换货款式" in exchange_df.columns:
             for _, row in exchange_df.iterrows():
                 original_sku = str(row["原款式"]).strip()
                 new_sku = str(row["换货款式"]).strip()
-                # 替换提取数量（原款 → 换货）
+                # 替换提取数量（原款 → 换货）——旧逻辑：将该原款当日全部提取量转移给新款
                 if sku_counts_all.get(original_sku):
                     qty = sku_counts_all.pop(original_sku)
                     sku_counts_all[new_sku] += qty
                 # 直接修改库存（对应日期列）：原款 +1、换货 -1
                 stock_df.loc[stock_df["SKU编码"] == original_sku, stock_date_col] += 1
                 stock_df.loc[stock_df["SKU编码"] == new_sku, stock_date_col] -= 1
-            st.success("换货处理完成：已替换提取数量并调整库存（原款 +1 / 换货 -1）")
+            st.success("换货处理完成（旧格式）：已替换提取数量并调整库存（原款 +1 / 换货 -1）")
         else:
-            st.warning("换货表中必须包含“原款式”和“换货款式”两列")
+            st.warning("换货表（旧格式）中必须包含“原款式”和“换货款式”两列")
+
+    # —— 达人换货统计表（新格式，逐行一件）：原款 -1、发货 +1；库存原款 +1、发货 -1 ——
+    if creator_swap_df is not None:
+        # 兼容不同空格/命名
+        rename_map = {}
+        cols = [c.strip() for c in creator_swap_df.columns]
+        creator_swap_df.columns = cols
+        if "原款式 SKU" in cols:
+            rename_map["原款式 SKU"] = "原SKU"
+        if "原款式SKU" in cols:
+            rename_map["原款式SKU"] = "原SKU"
+        if "发货款式SKU" in cols:
+            rename_map["发货款式SKU"] = "新SKU"
+        if "发货款式 SKU" in cols:
+            rename_map["发货款式 SKU"] = "新SKU"
+        creator_swap_df = creator_swap_df.rename(columns=rename_map)
+
+        if {"原SKU", "新SKU"}.issubset(creator_swap_df.columns):
+            # 逐行一件执行：sku_counts_all[原]-=1; sku_counts_all[新]+=1; 库存 原+1 新-1
+            applied_rows = 0
+            missing_in_sold = 0
+            for _, row in creator_swap_df.iterrows():
+                original_sku = str(row["原SKU"]).strip()
+                new_sku = str(row["新SKU"]).strip()
+
+                # 对“提取/售出计数”的修正（仅逐件）
+                if original_sku:
+                    if sku_counts_all.get(original_sku, 0) > 0:
+                        sku_counts_all[original_sku] -= 1
+                        if sku_counts_all[original_sku] == 0:
+                            del sku_counts_all[original_sku]
+                    else:
+                        # 统计表可能有“原SKU”不在当日提取里的情况
+                        missing_in_sold += 1
+                if new_sku:
+                    sku_counts_all[new_sku] += 1
+
+                # 对库存的修正：原款 +1、发货 -1
+                if original_sku:
+                    stock_df.loc[stock_df["SKU编码"] == original_sku, stock_date_col] += 1
+                if new_sku:
+                    stock_df.loc[stock_df["SKU编码"] == new_sku, stock_date_col] -= 1
+
+                applied_rows += 1
+
+            msg_tail = "" if missing_in_sold == 0 else f"；其中 {missing_in_sold} 行原SKU未在当日提取中找到，仅执行了库存修正与发货SKU计数增加"
+            st.success(f"达人换货处理完成（新格式，逐行一件）：共应用 {applied_rows} 行{msg_tail}")
+        else:
+            st.warning("达人换货统计表需要包含列：“原款式 SKU/原款式SKU” 与 “发货款式SKU/发货款式 SKU”")
 
     # —— 合并库存数据（NM001 同样参与扣减） ——
     stock_df["Sold"] = stock_df["SKU编码"].map(sku_counts_all).fillna(0).astype(int)
