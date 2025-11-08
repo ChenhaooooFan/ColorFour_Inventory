@@ -254,7 +254,7 @@ if selected_pdfs and csv_file:
             diff = total_actual - total_expected_raw
             total_status = (
                 f"不一致（差 {diff}；bundle 影响 +{total_bundle_extra}；"
-                f"Mystery 抵扣 −{total_mystery}；按理应为 {total_expected_final}）"
+                f"Mystery 抵扣 −{total_mystery}；按理应应为 {total_expected_final}）"
             )
 
         total_row = {
@@ -383,23 +383,75 @@ if selected_pdfs and csv_file:
         else:
             st.warning("达人换货统计表需要包含列：“原款式 SKU/原款式SKU” 与 “发货款式SKU/发货款式 SKU”")
 
-    # —— 合并库存数据（NM001 同样参与扣减） ——
-    stock_df["Sold"] = stock_df["SKU编码"].map(sku_counts_all).fillna(0).astype(int)
-    stock_df["New Stock"] = stock_df[stock_date_col] - stock_df["Sold"]
+    # ========= 新增功能：B4G1 表格（每行可包含多个 Full SKU，按分隔符拆分） =========
+    st.subheader("B4G1 表格（CSV）")
+    st.caption("说明：上传包含列 **Full SKU** 的 CSV；每行可含多个 SKU（例如：`NPX001-M,NLJ002-M`），每个 SKU 视为扣减 1 件。分隔符支持：逗号/中文逗号/顿号/分号/空白。")
+    b4g1_file = st.file_uploader("上传 B4G1 表格（CSV，仅需包含列 Full SKU）", type=["csv"], key="b4g1_uploader")
 
-    summary_df = stock_df[["SKU编码", stock_date_col, "Sold", "New Stock"]].copy()
-    summary_df.columns = ["SKU", "Old Stock", "Sold Qty", "New Stock"]
+    b4g1_df = None
+    b4g1_counts = defaultdict(int)   # {sku: count}
+    total_b4g1 = 0
+
+    if b4g1_file is not None:
+        # 尝试不同编码读取
+        read_ok = False
+        for enc in ("utf-8", "utf-8-sig", "gbk"):
+            try:
+                b4g1_df = pd.read_csv(b4g1_file, encoding=enc)
+                read_ok = True
+                break
+            except Exception:
+                b4g1_file.seek(0)
+        if not read_ok:
+            st.error("B4G1 CSV 编码无法识别，请用 UTF-8 重新导出")
+        else:
+            b4g1_df.columns = [c.strip() for c in b4g1_df.columns]
+            if "Full SKU" not in b4g1_df.columns:
+                st.error("B4G1 表格必须包含列：Full SKU")
+            else:
+                # 逐行解析 Full SKU 字段，按分隔符拆分为多个 SKU
+                splitter = re.compile(r"[,\uFF0C\u3001;；\s]+")  # 英/中逗号、顿号、分号、空白
+                token_list = []
+                for cell in b4g1_df["Full SKU"].astype(str):
+                    parts = [t.strip() for t in splitter.split(cell) if t.strip()]
+                    token_list.extend(parts)
+                if token_list:
+                    vc = pd.Series(token_list).value_counts()
+                    for sku, cnt in vc.items():
+                        b4g1_counts[sku] += int(cnt)
+                    total_b4g1 = int(vc.sum())
+
+                    st.success(f"B4G1 扣减统计完成：共 {total_b4g1} 件（{len(vc)} 个 SKU）")
+                    b4g1_show_tbl = pd.DataFrame({"SKU": vc.index, "B4G1 扣减件数": vc.values})
+                    st.dataframe(b4g1_show_tbl, use_container_width=True)
+                else:
+                    st.info("B4G1 表中未解析到有效 SKU。")
+
+    # —— 合并库存数据（NM001 同样参与扣减） + B4G1 扣减 ——
+    stock_df["Sold"] = stock_df["SKU编码"].map(sku_counts_all).fillna(0).astype(int)
+    stock_df["B4G1 Deduct"] = stock_df["SKU编码"].map(b4g1_counts).fillna(0).astype(int)
+    stock_df["New Stock"] = stock_df[stock_date_col] - stock_df["Sold"] - stock_df["B4G1 Deduct"]
+
+    summary_df = stock_df[["SKU编码", stock_date_col, "Sold", "B4G1 Deduct", "New Stock"]].copy()
+    summary_df.columns = ["SKU", "Old Stock", "Sold Qty", "B4G1 Deduct", "New Stock"]
     summary_df.index += 1
     summary_df.loc["合计"] = [
         "—",
         summary_df["Old Stock"].sum(),
         summary_df["Sold Qty"].sum(),
+        summary_df["B4G1 Deduct"].sum(),
         summary_df["New Stock"].sum()
     ]
 
     # 展示库存更新结果
     st.subheader("库存更新结果")
     st.dataframe(summary_df, use_container_width=True)
+
+    # 负库存提示（可帮助快速发现问题）
+    neg_df = summary_df[(summary_df.index != "合计") & (summary_df["New Stock"] < 0)]
+    if not neg_df.empty:
+        st.error(f"警告：{len(neg_df)} 个 SKU 新库存为负数，请核对：")
+        st.dataframe(neg_df[["SKU","Old Stock","Sold Qty","B4G1 Deduct","New Stock"]], use_container_width=True)
 
     # 总对账提示（顺序：原始 → bundle → bundle−NM001）
     total_sold = summary_df.loc["合计", "Sold Qty"]
@@ -422,15 +474,40 @@ if selected_pdfs and csv_file:
                 f"bundle−Mystery 调整后: {total_expected_final}（bundle +{total_bundle_extra}，Mystery −{total_mystery}）。"
             )
 
+    # B4G1 提示（不影响 Sold 与 PDF 对账）
+    if total_b4g1 > 0:
+        st.info(f"B4G1 额外扣减：共 {total_b4g1} 件（不计入 Sold，对账仅影响库存）。")
+
     # 一键复制 New Stock
     st.subheader("一键复制 New Stock")
     new_stock_text = "\n".join(summary_df.iloc[:-1]["New Stock"].astype(str).tolist())
     st.code(new_stock_text, language="text")
 
-    # 下载 Excel
+    # （可选）一键复制 B4G1 扣减
+    if "B4G1 Deduct" in summary_df.columns:
+        st.subheader("一键复制 B4G1 扣减")
+        b4g1_text = "\n".join(summary_df.iloc[:-1]["B4G1 Deduct"].astype(str).tolist())
+        st.code(b4g1_text, language="text")
+
+    # 下载 Excel（多表导出，新增 B4G1 扣减明细）
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        summary_df.to_excel(writer, index_label="序号")
+        summary_df.to_excel(writer, sheet_name="Summary", index_label="序号")
+        if 'pdf_df' in locals() and not pdf_df.empty:
+            pdf_df.to_excel(writer, sheet_name="PDF对账", index=False)
+        if creator_swap_df is not None and 'swap_log_df' in locals():
+            swap_log_df.to_excel(writer, sheet_name="达人换货明细", index=False)
+        if creator_swap_df is not None and 'recon_df' in locals():
+            recon_df.to_excel(writer, sheet_name="Sold对账", index=True)
+        if creator_swap_df is not None and 'stock_delta_df' in locals():
+            stock_delta_df.to_excel(writer, sheet_name="库存变动", index=True)
+        if b4g1_file is not None and total_b4g1 > 0 and 'b4g1_counts' in locals():
+            b4g1_out = pd.DataFrame({
+                "Full SKU": list(b4g1_counts.keys()),
+                "B4G1 扣减件数": list(b4g1_counts.values())
+            }).sort_values("Full SKU").reset_index(drop=True)
+            b4g1_out.to_excel(writer, sheet_name="B4G1 扣减明细", index=False)
+
     st.download_button(
         label="下载库存更新表 Excel",
         data=output.getvalue(),
@@ -447,7 +524,9 @@ if selected_pdfs and csv_file:
         "bundle 额外件数(+)": total_bundle_extra if total_bundle_extra else "",
         "Mystery（NM001）件数(−)": total_mystery if total_mystery else "",
         "PDF标注数量（最终，bundle−Mystery）": total_expected_final if total_expected_final else "",
-        "提取出货数量": total_sold
+        "提取出货数量": total_sold,
+        "B4G1 文件": (b4g1_file.name if b4g1_file else ""),
+        "B4G1 扣减件数": (total_b4g1 if total_b4g1 else "")
     }
     if os.path.exists(history_file):
         history_df = pd.read_csv(history_file)
