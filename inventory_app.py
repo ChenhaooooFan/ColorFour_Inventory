@@ -8,7 +8,7 @@ from datetime import datetime
 import os
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="NailVesta 库存系统", layout="centered")
+st.set_page_config(page_title="NailVesta 库存系统", page_icon="💅", layout="centered")
 st.title("ColorFour Inventory 系统（fitz 解析 + bundle 修复 + Mystery 抵扣期望 + Shopify Picking List 合并扣库存）")
 
 # 上传文件（PDF 支持多选）
@@ -73,10 +73,12 @@ ITEM_QTY_RE = re.compile(r"Item\s+quantity[:：]?\s*(\d+)", re.I)
 SHOPIFY_SKU_RE = re.compile(r"\b((?:[A-Z]{3}\d{3}|NM001)-(?:S|M|L))\b")
 SHOPIFY_OF_RE = re.compile(r"\b(\d+)\s+of\s+(\d+)\b", re.I)
 
+
 def normalize_text(t: str) -> str:
-    t = t.replace("\u00ad","").replace("\u200b","").replace("\u00a0"," ")
-    t = t.replace("–","-").replace("—","-")
+    t = t.replace("\u00ad", "").replace("\u200b", "").replace("\u00a0", " ")
+    t = t.replace("–", "-").replace("—", "-")
     return t
+
 
 def fix_orphan_digit_before_size(txt: str) -> str:
     """
@@ -86,6 +88,7 @@ def fix_orphan_digit_before_size(txt: str) -> str:
     pattern = re.compile(
         r'(?P<prefix>(?:[A-Z]{3}\d{3}|NM001){0,3}(?:[A-Z]{3}\d{2}|NM001))\s*[\r\n]+\s*(?P<d>\d)\s*-\s*(?P<size>[SML])'
     )
+
     def _join(m):
         prefix = m.group('prefix')
         d = m.group('d')
@@ -93,6 +96,7 @@ def fix_orphan_digit_before_size(txt: str) -> str:
         if prefix.endswith('NM001'):
             return f"{prefix}-{size}"
         return f"{prefix}{d}-{size}"
+
     prev = None
     cur = txt
     while prev != cur:
@@ -100,17 +104,23 @@ def fix_orphan_digit_before_size(txt: str) -> str:
         cur = pattern.sub(_join, cur)
     return cur
 
+
 def parse_code_parts(code: str):
     """将主体按 NM001 或 6位块切分，限制 1–4 件。全部成功返回列表，否则 None。"""
     parts, i, n = [], 0, len(code)
     while i < n:
         if code.startswith('NM001', i):
-            parts.append('NM001'); i += 5; continue
-        seg = code[i:i+6]
+            parts.append('NM001')
+            i += 5
+            continue
+        seg = code[i:i + 6]
         if re.fullmatch(r'[A-Z]{3}\d{3}', seg):
-            parts.append(seg); i += 6; continue
+            parts.append(seg)
+            i += 6
+            continue
         return None
     return parts if 1 <= len(parts) <= 4 else None
+
 
 def expand_bundle(counter: dict, sku_with_size: str, qty: int):
     """
@@ -121,6 +131,7 @@ def expand_bundle(counter: dict, sku_with_size: str, qty: int):
     if '-' not in s:
         counter[s] += qty
         return 0, (qty if s == 'NM001' else 0)
+
     code, size = s.split('-', 1)
     parts = parse_code_parts(code)
     if parts:
@@ -132,8 +143,10 @@ def expand_bundle(counter: dict, sku_with_size: str, qty: int):
                 mystery_units += qty
         extra = (len(parts) - 1) * qty
         return extra, mystery_units
+
     counter[s] += qty
     return 0, (qty if code == 'NM001' else 0)
+
 
 def _read_pdf_text(file_bytes: bytes) -> str:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -142,6 +155,7 @@ def _read_pdf_text(file_bytes: bytes) -> str:
     text = normalize_text(text_raw)
     text = fix_orphan_digit_before_size(text)
     return text
+
 
 def parse_pdf_with_fitz(file_bytes: bytes):
     """
@@ -158,7 +172,7 @@ def parse_pdf_with_fitz(file_bytes: bytes):
 
     for m in SKU_BUNDLE_WITH_SIZE.finditer(text_fixed):
         token = re.sub(r'\s+', '', m.group(1))
-        after = text_fixed[m.end(): m.end()+80]
+        after = text_fixed[m.end(): m.end() + 80]
 
         mq = QTY_LABEL_RE.search(after)
         if mq:
@@ -172,10 +186,10 @@ def parse_pdf_with_fitz(file_bytes: bytes):
         mystery_units += myst
 
     for m in SKU_SOLO_NM_ONLY.finditer(text_fixed):
-        next_chunk = text_fixed[m.end(): m.end()+3]
+        next_chunk = text_fixed[m.end(): m.end() + 3]
         if '-' in next_chunk:
             continue
-        after = text_fixed[m.end(): m.end()+120]
+        after = text_fixed[m.end(): m.end() + 120]
 
         mq = QTY_LABEL_RE.search(after)
         if mq:
@@ -188,6 +202,7 @@ def parse_pdf_with_fitz(file_bytes: bytes):
         mystery_units += qty
 
     return expected_total_raw, sku_counts, bundle_extra_units, mystery_units
+
 
 def parse_shopify_picking_pdf(file_bytes: bytes):
     """
@@ -211,6 +226,7 @@ def parse_shopify_picking_pdf(file_bytes: bytes):
     total_units = int(sum(sku_counts.values()))
     return sku_counts, total_units, order_ids
 
+
 # ---------- 主流程 ----------
 if (selected_pdfs or selected_shopify_pdfs) and csv_file:
     st.success("文件上传成功，开始处理...")
@@ -222,6 +238,9 @@ if (selected_pdfs or selected_shopify_pdfs) and csv_file:
     if "SKU编码" not in stock_df.columns:
         st.error("库存表缺少列：SKU编码")
         st.stop()
+
+    # ✅ SKU 统一转文字并去空格，避免匹配失败
+    stock_df["SKU编码"] = stock_df["SKU编码"].astype(str).str.strip()
 
     # ✅ 保持库存 CSV 原始顺序
     stock_df["_row_order"] = range(len(stock_df))
@@ -246,6 +265,16 @@ if (selected_pdfs or selected_shopify_pdfs) and csv_file:
         st.error("未找到库存日期列（如 '06/03'）")
         st.stop()
     stock_date_col = stock_col[0]
+
+    # ✅ 关键修复：库存日期列必须先转成数字，避免 New Stock / 一键复制时报 TypeError
+    stock_df[stock_date_col] = (
+        pd.to_numeric(
+            stock_df[stock_date_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce"
+        )
+        .fillna(0)
+        .astype(int)
+    )
 
     # =========================
     # A) 原 Picking List PDF：解析 + expected 对账（保留原逻辑）
@@ -411,6 +440,12 @@ if (selected_pdfs or selected_shopify_pdfs) and csv_file:
                 original_sku = str(row["原SKU"]).strip()
                 new_sku = str(row["新SKU"]).strip()
 
+                # 跳过空值 / nan
+                if original_sku.lower() == "nan":
+                    original_sku = ""
+                if new_sku.lower() == "nan":
+                    new_sku = ""
+
                 found_in_sold = False
                 if original_sku:
                     if sku_counts_all.get(original_sku, 0) > 0:
@@ -489,12 +524,17 @@ if (selected_pdfs or selected_shopify_pdfs) and csv_file:
 
     summary_df = stock_df[["SKU编码", stock_date_col, "Sold", "New Stock"]].copy()
     summary_df.columns = ["SKU", "Old Stock", "Sold Qty", "New Stock"]
+
+    # ✅ 确保这几列都是数字，避免显示 / 复制 / 合计报错
+    for c in ["Old Stock", "Sold Qty", "New Stock"]:
+        summary_df[c] = pd.to_numeric(summary_df[c], errors="coerce").fillna(0).astype(int)
+
     summary_df.index += 1
     summary_df.loc["合计"] = [
         "—",
-        summary_df["Old Stock"].sum(),
-        summary_df["Sold Qty"].sum(),
-        summary_df["New Stock"].sum()
+        int(summary_df["Old Stock"].sum()),
+        int(summary_df["Sold Qty"].sum()),
+        int(summary_df["New Stock"].sum())
     ]
 
     st.subheader("库存更新结果（Picking List + Shopify 一起扣库存）")
@@ -527,7 +567,12 @@ if (selected_pdfs or selected_shopify_pdfs) and csv_file:
 
     # 一键复制 New Stock
     st.subheader("一键复制 New Stock")
-    new_stock_text = "\n".join(summary_df.iloc[:-1]["New Stock"].astype(str).tolist())
+
+    # ✅ 关键修复：先强制转数字，再转文字，避免 join 遇到 int/float/空值时报 TypeError
+    copy_series = summary_df.iloc[:-1]["New Stock"].copy()
+    copy_series = pd.to_numeric(copy_series, errors="coerce").fillna(0).astype(int)
+    new_stock_text = "\n".join(copy_series.map(str).tolist())
+
     st.code(new_stock_text, language="text")
 
     # 下载 Excel
@@ -537,7 +582,8 @@ if (selected_pdfs or selected_shopify_pdfs) and csv_file:
     st.download_button(
         label="下载库存更新表 Excel",
         data=output.getvalue(),
-        file_name="库存更新结果.xlsx"
+        file_name="库存更新结果.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
     # 上传历史记录
