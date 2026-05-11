@@ -260,11 +260,20 @@ if (selected_pdfs or selected_shopify_pdfs) and csv_file:
         st.json(dup_list)
         st.stop()
 
-    stock_col = [col for col in stock_df.columns if re.match(r"\d{2}/\d{2}", col)]
+    # ✅ 找到所有像 06/03、6/3 这样的库存日期列
+    # 之前代码默认用第 1 个日期列 stock_col[0]，如果表里有多个日期列，就可能拿错列，导致 New Stock 看起来像“减了多少/负数”。
+    stock_col = [col for col in stock_df.columns if re.match(r"^\s*\d{1,2}/\d{1,2}\s*$", str(col))]
     if not stock_col:
-        st.error("未找到库存日期列（如 '06/03'）")
+        st.error("未找到库存日期列（如 '06/03'）。请确认库存表里有日期库存列。")
         st.stop()
-    stock_date_col = stock_col[0]
+
+    stock_date_col = st.selectbox(
+        "选择本次要扣减的库存列（Old Stock 来源）",
+        options=stock_col,
+        index=len(stock_col) - 1,  # 默认选最后一个日期列，通常是最新库存
+        help="New Stock = 你选择的这一列库存 - Sold Qty。请选你要粘贴回去对应的当前库存日期列。"
+    )
+    st.caption(f"当前使用库存列：{stock_date_col}；一键复制的是扣减后的 New Stock，不是 Sold Qty。")
 
     # ✅ 关键修复：库存日期列必须先转成数字，避免 New Stock / 一键复制时报 TypeError
     stock_df[stock_date_col] = (
